@@ -1,0 +1,30 @@
+# Environments
+.env
+.env.local
+venv/
+.venv/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor & IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker / Database persistent data
+mssql_data/
+
+# Logs
+*.log
