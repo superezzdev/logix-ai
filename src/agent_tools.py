@@ -1,5 +1,6 @@
 import os
 import urllib
+import requests
 from pathlib import Path
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
@@ -19,7 +20,7 @@ db_user = os.getenv("SQL_AGENT_USER", "USR_LOGIX_RO")
 db_password = os.getenv("SQL_AGENT_PASSWORD")
 
 # ==========================================
-# 2. CORE TELEMETRY DATABASE TOOL
+# 2. CORE TELEMETRY & CORRIDOR TOOLS
 # ==========================================
 
 @tool
@@ -64,6 +65,37 @@ def query_telemetry_db(sql_query: str) -> str:
     except Exception as e:
         return f"Database Error: {str(e)}"
 
+@tool
+def fetch_corridor_conditions(latitude: float, longitude: float) -> str:
+    """
+    Fetches real-time weather and corridor conditions from a live REST API for given GPS coordinates.
+    Provides temperature, wind speed, and computed corridor congestion index.
+    """
+    try:
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&current_weather=true"
+        response = requests.get(url, timeout=6)
+        response.raise_for_status()
+        
+        payload = response.json().get("current_weather", {})
+        temp = payload.get("temperature", "N/A")
+        wind = payload.get("windspeed", 0.0)
+        
+        congestion_index = 8.5 if wind > 10.0 else 2.5
+        status_note = "High Transit Disruption" if wind > 10.0 else "Corridor Normal"
+        
+        return (
+            f"--- LIVE CORRIDOR TELEMETRY ---\n"
+            f"Target GPS: {latitude}, {longitude}\n"
+            f"External Temp: {temp}°C | Wind Speed: {wind} km/h\n"
+            f"Corridor Risk: {status_note} (Congestion Index: {congestion_index}/10)\n"
+            f"-------------------------------"
+        )
+    except Exception as e:
+        return f"Corridor API Communication Failure: {str(e)}"
+
 if __name__ == "__main__":
     print("\n--- Testing Tool 1: SQL Telemetry View ---")
     print(query_telemetry_db.invoke("SELECT TOP 2 Latitude, Longitude, Current_Temperature_C FROM LOGIX_VIEWS.VW_ACTIVE_FLEET"))
+    
+    print("\n--- Testing Tool 2: Live Corridor API ---")
+    print(fetch_corridor_conditions.invoke({"latitude": 33.77, "longitude": -118.19}))
