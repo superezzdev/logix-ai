@@ -41,26 +41,38 @@ df_legacy = df[list(legacy_mapping.keys())].rename(columns=legacy_mapping)
 # Add a fake ingestion flag to make it look like an automated legacy system
 df_legacy['SYS_INGEST_FLAG'] = 'Y'
 
-# 3. Connect to Docker MSSQL Server
-print("Connecting to legacy MSSQL Database...")
-# Use the pyodbc driver. (Ensure you have ODBC Driver 17 or 18 for SQL Server installed on your OS)
-connection_string = (
-        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-        f"SERVER={db_host},{db_port};"
-        f"DATABASE=master;"
-        f"UID={db_user};"
-        f"PWD={db_password};"
-        f"Encrypt=no;"
-        f"TrustServerCertificate=yes;"
-    )
+# 3. Connect to Database (PostgreSQL or MSSQL)
+sql_dialect = os.getenv("SQL_DIALECT", "postgresql").strip().lower()
+db_name = os.getenv("SQL_DATABASE", "logix_db")
 
-params = urllib.parse.quote_plus(connection_string)
+print(f"Connecting to {sql_dialect.upper()} Database ({db_host}:{db_port}/{db_name})...")
+quoted_pwd = urllib.parse.quote_plus(db_password) if db_password else ""
 
-engine = create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
+if sql_dialect in ("postgres", "postgresql", "psql"):
+    engine = create_engine(f"postgresql+psycopg2://{db_user}:{quoted_pwd}@{db_host}:{db_port}/{db_name}")
+    target_schema = "public"
+else:
+    try:
+        import pymssql
+        host = "127.0.0.1" if db_host in ("localhost", "127.0.0.1") else db_host
+        engine = create_engine(f"mssql+pymssql://{db_user}:{quoted_pwd}@{host}:{db_port}/master")
+    except Exception:
+        connection_string = (
+            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+            f"SERVER={db_host},{db_port};"
+            f"DATABASE=master;"
+            f"UID={db_user};"
+            f"PWD={db_password};"
+            f"Encrypt=no;"
+            f"TrustServerCertificate=yes;"
+        )
+        params = urllib.parse.quote_plus(connection_string)
+        engine = create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
+    target_schema = "dbo"
 
 # 4. Ingest data into the messy table name
 table_name = 'TBL_SC_FLEET_HIST_RAW'
 print(f"Ingesting into {table_name}. This may take a minute...")
-df_legacy.to_sql(table_name, engine, if_exists='replace', index=False, schema='dbo')
+df_legacy.to_sql(table_name, engine, if_exists='replace', index=False, schema=target_schema)
 
 print("✅ Legacy data ingestion complete!")
