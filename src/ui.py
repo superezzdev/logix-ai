@@ -32,20 +32,31 @@ db_port = os.getenv("SQL_SERVER_PORT", "1433")
 db_user = os.getenv("SQL_AGENT_USER", "USR_LOGIX_RO")
 db_password = os.getenv("SQL_AGENT_PASSWORD")
 
+db_dialect = os.getenv("SQL_DIALECT", "postgresql").strip().lower()
+db_name = os.getenv("SQL_DATABASE", "logix_db")
+
 # Engine for the Agent to write logs using its standard credentials
-connection_string = (
-    f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-    f"SERVER={db_host},{db_port};"
-    f"DATABASE=master;"
-    f"UID={db_user};"
-    f"PWD={db_password};"
-    f"Encrypt=no;"
-    f"TrustServerCertificate=yes;"
-)
+quoted_pwd = urllib.parse.quote_plus(db_password) if db_password else ""
 
-log_params = urllib.parse.quote_plus(connection_string)
-
-log_engine = create_engine(f"mssql+pyodbc:///?odbc_connect={log_params}")
+if db_dialect in ("postgres", "postgresql", "psql"):
+    log_engine = create_engine(f"postgresql+psycopg2://{db_user}:{quoted_pwd}@{db_host}:{db_port}/{db_name}")
+else:
+    try:
+        import pymssql
+        host = "127.0.0.1" if db_host in ("localhost", "127.0.0.1") else db_host
+        log_engine = create_engine(f"mssql+pymssql://{db_user}:{quoted_pwd}@{host}:{db_port}/master")
+    except Exception:
+        connection_string = (
+            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+            f"SERVER={db_host},{db_port};"
+            f"DATABASE=master;"
+            f"UID={db_user};"
+            f"PWD={db_password};"
+            f"Encrypt=no;"
+            f"TrustServerCertificate=yes;"
+        )
+        log_params = urllib.parse.quote_plus(connection_string)
+        log_engine = create_engine(f"mssql+pyodbc:///?odbc_connect={log_params}")
 
 def write_audit_log(session_id, node_name, tool_name, content):
     """Silently writes agent execution traces to the SQL audit table using agent permissions."""
@@ -110,6 +121,8 @@ with st.sidebar:
     if st.button("🗑️ Purge Dispatch Workspace Session", use_container_width=True):
         st.session_state.ui_messages = []
         st.session_state.thread_id = str(uuid.uuid4())
+        if "system_prompt_initialized" in st.session_state:
+            del st.session_state["system_prompt_initialized"]
         st.rerun()
 
 # ==========================================
@@ -147,70 +160,108 @@ if app_mode == "🧊 Dispatch Console":
             current_traces = [] 
             
             with st.status("🧠 Initializing Core Reasoner Node...", expanded=True) as status:
-                events = logix_agent.stream(
-                    {"messages": [HumanMessage(content=user_input)]}, 
-                    config=thread_config,
-                    stream_mode="updates"
-                )
+                # Ensure system prompt is provided to new agent threads
+                messages_payload = []
+                prompt_file = project_root / "src" / "prompts" / "system_prompt.txt"
+                try:
+                    with open(prompt_file, "r", encoding="utf-8") as f:
+                        system_content = f.read()
+                except Exception:
+                    system_content = "You are a Senior Data Scientist for a logistics company."
+                from langchain_core.messages import SystemMessage
+
+                if "system_prompt_initialized" not in st.session_state:
+                    messages_payload.append(SystemMessage(content=system_content))
+                    st.session_state.system_prompt_initialized = True
                 
-                for event in events:
-                    for node_name, node_state in event.items():
-                        
-                        if node_name == "reasoner":
-                            latest_msg = node_state["messages"][-1]
+                messages_payload.append(HumanMessage(content=user_input))
+
+                def process_events(events_stream):
+                    res = ""
+                    for event in events_stream:
+                        for node_name, node_state in event.items():
                             
-                            # A. Intercept Tool Call Requests (Inputs)
-                            if hasattr(latest_msg, "tool_calls") and latest_msg.tool_calls:
-                                status.update(label="🧠 Agent generated tool parameters...")
-                                for tool_call in latest_msg.tool_calls:
-                                    st.markdown(f"**⚡ Intent Recognized:** `{tool_call['name']}`")
-                                    with st.expander(f"📥 View Generated Input ({tool_call['name']})", expanded=False):
+                            if node_name == "reasoner":
+                                latest_msg = node_state["messages"][-1]
+                                
+                                # A. Intercept Tool Call Requests (Inputs)
+                                if hasattr(latest_msg, "tool_calls") and latest_msg.tool_calls:
+                                    status.update(label="🧠 Agent generated tool parameters...")
+                                    for tool_call in latest_msg.tool_calls:
+                                        st.markdown(f"**⚡ Intent Recognized:** `{tool_call['name']}`")
+                                        st.caption(f"Generated Parameters ({tool_call['name']}):")
                                         st.json(tool_call['args'])
-                                    
-                                    current_traces.append({
-                                        "type": "tool_input",
-                                        "name": tool_call['name'],
-                                        "args": tool_call['args']
-                                    })
+                                        
+                                        current_traces.append({
+                                            "type": "tool_input",
+                                            "name": tool_call['name'],
+                                            "args": tool_call['args']
+                                        })
+                                        
+                                        write_audit_log(
+                                            session_id=st.session_state.thread_id,
+                                            node_name="reasoner",
+                                            tool_name=tool_call['name'],
+                                            content=json.dumps(tool_call['args'])
+                                        )
+                                
+                                # B. Intercept Final Generation
+                                if latest_msg.content:
+                                    res = latest_msg.content
+                                    status.update(label="📝 Generating Operational Resolution Report...")
                                     
                                     write_audit_log(
                                         session_id=st.session_state.thread_id,
-                                        node_name="reasoner",
-                                        tool_name=tool_call['name'],
-                                        content=json.dumps(tool_call['args'])
+                                        node_name="reasoner_final",
+                                        tool_name="LLM Text Synthesis",
+                                        content=res
                                     )
-                            
-                            # B. Intercept Final Generation
-                            if latest_msg.content:
-                                final_response = latest_msg.content
-                                status.update(label="📝 Generating Operational Resolution Report...")
-                                
-                                write_audit_log(
-                                    session_id=st.session_state.thread_id,
-                                    node_name="reasoner_final",
-                                    tool_name="LLM Text Synthesis",
-                                    content=final_response
-                                )
-                                
-                        elif node_name == "tools":
-                            status.update(label="🔧 Executing Enterprise Subsystem Tools...")
-                            for msg in node_state.get("messages", []):
-                                if isinstance(msg, ToolMessage):
-                                    with st.expander(f"📤 View Raw Output ({msg.name})", expanded=False):
+                                    
+                            elif node_name == "tools":
+                                status.update(label="🔧 Executing Enterprise Subsystem Tools...")
+                                for msg in node_state.get("messages", []):
+                                    if isinstance(msg, ToolMessage):
+                                        st.markdown(f"**🔧 Executed:** `{msg.name}`")
                                         st.code(msg.content, language="text")
                                         
-                                    current_traces.append({
-                                        "type": "tool_output",
-                                        "name": msg.name,
-                                        "content": msg.content
-                                    })
-                                    
-                                    write_audit_log(
-                                        session_id=st.session_state.thread_id,
-                                        node_name="tools",
-                                        tool_name=msg.name,
-                                        content=msg.content
-                                    )
+                                        current_traces.append({
+                                            "type": "tool_output",
+                                            "name": msg.name,
+                                            "content": msg.content
+                                        })
+                                        
+                                        write_audit_log(
+                                            session_id=st.session_state.thread_id,
+                                            node_name="tools",
+                                            tool_name=msg.name,
+                                            content=msg.content
+                                        )
+                    return res
+
+                try:
+                    events = logix_agent.stream(
+                        {"messages": messages_payload}, 
+                        config=thread_config,
+                        stream_mode="updates"
+                    )
+                    final_response = process_events(events)
+                except Exception as stream_err:
+                    err_msg = str(stream_err)
+                    if "tool_calls" in err_msg and ("tool_call_id" in err_msg or "insufficient tool messages" in err_msg):
+                        # Auto-recover from corrupted thread state due to prior interrupted tool calls
+                        status.update(label="🔄 Restoring conversation thread state...", state="running")
+                        st.session_state.thread_id = str(uuid.uuid4())
+                        st.session_state.system_prompt_initialized = True
+                        recovered_thread_config = {"configurable": {"thread_id": st.session_state.thread_id}}
+                        fresh_payload = [SystemMessage(content=system_content), HumanMessage(content=user_input)]
+                        events = logix_agent.stream(
+                            {"messages": fresh_payload},
+                            config=recovered_thread_config,
+                            stream_mode="updates"
+                        )
+                        final_response = process_events(events)
+                    else:
+                        st.error(f"Reasoning Execution Error: {stream_err}")
                 
                 status.update(label="Incident Matrix Evaluation Complete", state="complete", expanded=False)
                 
@@ -252,20 +303,30 @@ elif app_mode == "🛡️ Security & Audit Logs":
         if input_user == expected_admin_user and input_pass == expected_admin_pass:
             try:
                 # Build an isolated admin connection string for viewing data
-                admin_params = urllib.parse.quote_plus(
-                    "DRIVER={ODBC Driver 18 for SQL Server};"
-                    f"SERVER={db_host},{db_port};"
-                    "DATABASE=master;"
-                    f"UID={input_user};"
-                    f"PWD={input_pass};"
-                    "Encrypt=no;"
-                    "TrustServerCertificate=yes;"
-                )
-                admin_engine = create_engine(f"mssql+pyodbc:///?odbc_connect={admin_params}")
+                quoted_pass = urllib.parse.quote_plus(input_pass) if input_pass else ""
+                if db_dialect in ("postgres", "postgresql", "psql"):
+                    admin_engine = create_engine(f"postgresql+psycopg2://{input_user}:{quoted_pass}@{db_host}:{db_port}/{db_name}")
+                else:
+                    try:
+                        import pymssql
+                        host = "127.0.0.1" if db_host in ("localhost", "127.0.0.1") else db_host
+                        admin_engine = create_engine(f"mssql+pymssql://{input_user}:{quoted_pass}@{host}:{db_port}/master")
+                    except Exception:
+                        admin_params = urllib.parse.quote_plus(
+                            "DRIVER={ODBC Driver 18 for SQL Server};"
+                            f"SERVER={db_host},{db_port};"
+                            "DATABASE=master;"
+                            f"UID={input_user};"
+                            f"PWD={input_pass};"
+                            "Encrypt=no;"
+                            "TrustServerCertificate=yes;"
+                        )
+                        admin_engine = create_engine(f"mssql+pyodbc:///?odbc_connect={admin_params}")
                 
                 with admin_engine.connect() as conn:
                     query = """
-                        SELECT LogID, Timestamp, SessionID, NodeExecuted, ToolName, Content 
+                        SELECT LogID AS "LogID", Timestamp AS "Timestamp", SessionID AS "SessionID", 
+                               NodeExecuted AS "NodeExecuted", ToolName AS "ToolName", Content AS "Content" 
                         FROM LOGIX_VIEWS.AgentAuditLog 
                         ORDER BY Timestamp DESC
                     """

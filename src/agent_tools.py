@@ -86,19 +86,37 @@ def query_telemetry_db(sql_query: str) -> str:
     Risk_Classification, Delay_Probability, Port_Congestion_Level, Route_Risk_Index.
     Always write standard T-SQL queries.
     """
-    connection_string = (
-            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-            f"SERVER={db_host},{db_port};"
-            f"DATABASE=master;"
-            f"UID={db_user};"
-            f"PWD={db_password};"
-            f"Encrypt=no;"
-            f"TrustServerCertificate=yes;"
-        )
+    import re
+    sql_dialect = os.getenv("SQL_DIALECT", "postgresql").strip().lower()
+    db_name = os.getenv("SQL_DATABASE", "logix_db")
+    quoted_pwd = urllib.parse.quote_plus(db_password) if db_password else ""
 
-    params = urllib.parse.quote_plus(connection_string)
-    
-    engine = create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
+    if sql_dialect in ("postgres", "postgresql", "psql"):
+        engine = create_engine(f"postgresql+psycopg2://{db_user}:{quoted_pwd}@{db_host}:{db_port}/{db_name}")
+        # Translate T-SQL 'SELECT TOP N ...' to PostgreSQL 'SELECT ... LIMIT N'
+        top_match = re.match(r"(?i)^\s*SELECT\s+TOP\s+(\d+)\s+(.+)$", sql_query.strip())
+        if top_match:
+            limit_n = top_match.group(1)
+            rest_of_query = top_match.group(2)
+            if "limit" not in rest_of_query.lower():
+                sql_query = f"SELECT {rest_of_query} LIMIT {limit_n}"
+    else:
+        try:
+            import pymssql
+            host = "127.0.0.1" if db_host in ("localhost", "127.0.0.1") else db_host
+            engine = create_engine(f"mssql+pymssql://{db_user}:{quoted_pwd}@{host}:{db_port}/master")
+        except Exception:
+            connection_string = (
+                f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+                f"SERVER={db_host},{db_port};"
+                f"DATABASE=master;"
+                f"UID={db_user};"
+                f"PWD={db_password};"
+                f"Encrypt=no;"
+                f"TrustServerCertificate=yes;"
+            )
+            params = urllib.parse.quote_plus(connection_string)
+            engine = create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
     
     try:
         if not sql_query.strip().upper().startswith("SELECT"):
